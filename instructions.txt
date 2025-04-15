@@ -1,0 +1,3 @@
+ADD F1, F2, F3
+SUB F4, F1, F5
+MUL F6, F4, F1
