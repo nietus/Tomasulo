@@ -946,6 +946,7 @@ public:
             cout << setw(3) << (rs.busy ? to_string(rs.A) : "-") << " | ";
             cout << setw(7) << (rs.busy ? to_string(rs.instructionIndex) : "-") << " |" << endl;
         }
+        cout << "--------------------------------------------------------------------" << endl;
     }
 };
 
