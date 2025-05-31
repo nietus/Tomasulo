@@ -1,0 +1,19 @@
+Este segundo trabalho (grupos de mesmo tamanho) compreende o desenvolvimento de um simulador (desenvolvido em C/C++) do algoritmo de Tomasulo,
+conforme últimos slides de superescalaridade. Não serão aceitos simuladores desenvolvidos em outra linguagem que não C/C++.
+
+Seu programa devera ler uma entrada (arquivo txt) de instruções,
+e processá-las seguindo os princípios de superescalaridade do algoritmo de Tomasulo.
+
+A saída devera conter os valores dos registradores usados nas instruções. Durante a execução do programa,
+devera ser possível ciclo a ciclo, qual a situação da janela de instruções (estações de reserva),
+com valores de todas as variáveis como previsto nos slides apresentados.
+
+Adicionalmente, devera ser incluído o README, contendo a documentação sobre os detalhes de implementação do simulador.
+Como entrega, pode ser enviado um link do GitHub, ou o código fonte (apenas fonte).
+
+Livro básico de referencia: Arquitetura de Computadores, uma Abordagem Quantitativa, Hennessy e Patterson.
+Existem ainda diversos vídeos e materiais sobre o algoritmo na internet, além de códigos já implementados.
+Observe no entanto, que você devera promover as saídas e exibições solicitadas, e explicar o funcionamento de seu simulador e código.
+
+IMPORTANTE: Todos os aspectos do algoritmo de Tomasulo deverão ser implementados.
+Também será necessário e possível alterar as instruções fornecidas na entrada, para avaliação do comportamento do simulador implementado.

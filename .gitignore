@@ -1,2 +1,7 @@
 .vscode
 *.exe
+build/Debug/tomasulo.o
+build/Debug/tomasulo2.o
+build/Debug/outDebug
+test2.txt
+test.txt
