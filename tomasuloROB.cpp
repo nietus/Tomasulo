@@ -346,6 +346,10 @@ private:
                 // Se o dado dependia de outra instrução, updateDependentRS terá atualizado o ROB.
                 resultData = rs->Vj; // O valor do STORE (Vj) é "transmitido" para sua própria entrada no ROB.
                 break;
+            case INVALID:
+                cerr << "Erro: Instrução inválida no WriteBack para índice " << originalInstIndex << endl;
+                resultData = 0;
+                return;
         }
 
         // Atualiza a entrada do ROB com o resultado/valor e estado.

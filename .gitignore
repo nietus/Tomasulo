@@ -5,3 +5,8 @@ build/Debug/tomasulo2.o
 build/Debug/outDebug
 test2.txt
 test.txt
+tomasuloROB_test.cpp
+tomasuloROB_1.cpp
+tomasuloROB_2.cpp
+build/Debug/tomasuloROB_2.o
+build/Debug/tomasuloROB_1.o
