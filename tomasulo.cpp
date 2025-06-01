@@ -1,19 +1,19 @@
-// Simulador do Algoritmo de Tomasulo
+// Simulador do Algoritmo de Tomasulo - versão ROB
 
-#include <iostream>  // Para entrada e saída padrão (cout, cin)
-#include <fstream>   // Para manipulação de arquivos (ifstream)
-#include <vector>    // Para usar vetores dinâmicos (std::vector)
-#include <string>    // Para usar strings (std::string)
-#include <sstream>   // Para manipulação de strings como streams (istringstream, stringstream)
-#include <map>       // Para usar mapas (std::map)
-#include <queue>     // Para usar filas (std::queue)
-#include <iomanip>   // Para manipulação da formatação de saída (setw, left)
-#include <limits>    // Para std::numeric_limits (usado para limpar buffer de entrada)
-#include <cstdlib>   // Para funções como atoi
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <sstream> // istringstream, stringstream
+#include <map>     // std::map
+#include <queue>   // std::queue
+#include <iomanip> // setw, left, right
+#include <limits>  // std::numeric_limits (limpar buffer de entrada)
+#include <cstdlib> // atoi
 
 using namespace std;
 
-// Definicao de tipos de instrucoes suportadas
+// Enumeração para os tipos de instruções suportadas.
 enum InstructionType
 {
     ADD,
@@ -22,1000 +22,979 @@ enum InstructionType
     DIV,
     LOAD,
     STORE,
-    INVALID  // Tipo de instrução inválido ou não reconhecido
+    INVALID
 };
 
-// Estrutura para representar uma instrucao
-// Contém informações sobre a operação e os ciclos de cada estágio no pipeline de Tomasulo
+// Enumeração para os estados de uma entrada no Reorder Buffer (ROB) - Controla o progresso da instrução desde a emissão até o commit.
+enum ROBState
+{
+    ROB_EMPTY,       // A entrada do ROB está livre (não está sendo usada).
+    ROB_ISSUE,       // A instrução foi emitida e alocada no ROB; aguarda na RS ou operandos.
+    ROB_EXECUTE,     // A instrução está atualmente em execução em uma unidade funcional.
+    ROB_WRITERESULT, // O resultado da instrução está pronto e foi escrito nesta entrada do ROB (via CDB), aguardando o commit.
+    // ROB_COMMIT é um estado transitório; após o commit, a entrada volta para ROB_EMPTY.
+};
+
+// Estrutura para representar uma instrução individual lida do arquivo de entrada - Contém a definição da operação e rastreia os ciclos dos estágios chave.
 struct Instruction
 {
-    InstructionType type;
-    string dest;    // Registrador de destino
-    string src1;    // Primeiro operando fonte (registrador ou offset para L.D/S.D, ou dado para S.D)
-    string src2;    // Segundo operando fonte (registrador ou registrador base para L.D/S.D)
-    // Variáveis para rastreamento de ciclos de execucao
-    int issue;      // Ciclo em que a instrucao foi emitida
-    int execComp;   // Ciclo em que a execucao foi concluida
-    int writeResult;    // Ciclo em que o resultado da instrução foi escrito no Common Data Bus
-
-    // Construtor - inicializa os ciclos com -1 para indicar que ainda não ocorreram
-    Instruction() : issue(-1), execComp(-1), writeResult(-1) {}
+    InstructionType type; // Tipo da operação (ex: ADD, LOAD).
+    string dest;          // Registrador de destino (ex: "F1"). Para STORE, armazena o offset.
+    string src1;          // Primeiro operando fonte. Para LOAD, é o offset; para STORE, é o registrador do dado.
+    string src2;          // Segundo operando fonte. Para LOAD/STORE, é o registrador base.
+    int issue = -1;       // Ciclo em que a instrução foi emitida.
+    int execComp = -1;    // Ciclo em que a execução foi concluída.
+    int writeResult = -1; // Ciclo em que o resultado foi escrito no ROB (via CDB).
+    int commitCycle = -1; // Ciclo em que a instrução foi cometida (commit).
 };
 
-// Estrutura para representar uma entrada na Estação de Reserva (Reservation Station - RS)
-// As RSs são buffers que guardam as instruções que estão aguardando operandos ou unidades funcionais
+// Estrutura para representar uma entrada no Reorder Buffer (ROB). O ROB é crucial para implementar a terminação em ordem e o tratamento preciso de exceções.
+struct ReorderBufferEntry
+{
+    bool busy = false;              // Indica se esta entrada do ROB está atualmente em uso.
+    int instructionIndex = -1;      // Índice da instrução original (no vetor 'instructions') associada a esta entrada.
+    InstructionType type = INVALID; // Tipo da instrução.
+    ROBState state = ROB_EMPTY;     // Estado atual da instrução dentro do ROB.
+    string destinationRegister;     // Nome do registrador de destino arquitetural (ex: "F1"). Vazio para STORE.
+    int value = 0;                  // Valor calculado (para ALU/LOAD) ou valor a ser armazenado (para STORE).
+    int address = 0;                // Endereço de memória calculado (relevante para LOAD/STORE).
+    bool valueReady = false;        // True se 'value' (resultado/dado do store) está pronto nesta entrada do ROB.
+};
+
+// Estrutura para representar uma entrada na Estação de Reserva (Reservation Station - RS). As RSs guardam instruções que aguardam operandos ou a disponibilidade de uma unidade funcional.
 struct ReservationStation
 {
-    bool busy;            // Indica se a estação de reserva está ocupada por uma instrução
-    InstructionType op;   // Operação a ser executada (ADD, MUL, etc.)
-    int Vj, Vk;           // Valores dos operandos fonte. Vj é para src1, Vk para src2 (ou registrador base em L/S)
-    string Qj, Qk;        // Nomes das estações de reserva que produzirão os operandos Vj e Vk, respectivamente.
-                          // Se o valor já estiver disponível, Qj/Qk estarão vazios.
-                          // Isso implementa a renomeação de registradores e o encaminhamento de dados.
-    string dest;          // Nome da RS de destino (tag) ou registrador de destino para instruções aritméticas/LOAD.
-                          // Para STORE, este campo não representa um registrador de destino no banco.
-    int A;                // Campo de endereço. Usado para L.D/S.D para armazenar o offset.
-                          // O endereço efetivo será calculado como A + Vk (offset + valor do reg. base).
-    int instructionIndex; // Índice da instrução original no vetor 'instructions' associada a esta RS.
-
-    // Construtor - inicializa a RS como não ocupada e campos com valores padrão.
-    ReservationStation() : busy(false), op(INVALID), Vj(0), Vk(0), A(0), instructionIndex(-1) {}
+    bool busy = false;            // Indica se a RS está ocupada.
+    InstructionType op = INVALID; // Tipo da operação sendo processada.
+    int Vj = 0, Vk = 0;           // Valores dos operandos fonte (Vj para src1, Vk para src2/base).
+    string Qj = "", Qk = "";      // Tags (índices do ROB como string) das entradas do ROB que produzirão Vj e Vk.
+                                  // Se vazios, os valores em Vj/Vk estão disponíveis.
+    string destRobIndex = "";     // Índice (como string) da entrada do ROB para a qual esta RS escreverá seu resultado.
+    int A = 0;                    // Armazena o offset para instruções L.D/S.D.
+    int instructionIndex = -1;    // Índice da instrução original associada.
 };
 
-// Estrutura para representar o status de um registrador no Banco de Registradores
-// Usado para implementar a renomeação de registradores.
+// Estrutura para representar o status de um registrador arquitetural. Usada para renomeação: indica se o valor do registrador está pendente e qual entrada do ROB o produzirá.
 struct RegisterStatus
 {
-    bool busy;          // Indica se o registrador está aguardando um resultado de alguma RS.
-    string reorderName; // Nome da estação de reserva (tag) que produzirá o resultado para este registrador.
-                        // Se o registrador não estiver busy, este campo não é relevante.
-
-    // Construtor padrão: inicializa o registrador como não ocupado.
-    RegisterStatus() : busy(false), reorderName("") {}
+    bool busy = false; // True se o registrador está aguardando um resultado de uma entrada do ROB.
+    int robIndex = -1; // Índice da entrada do ROB que produzirá o valor para este registrador.
+                       // -1 se o valor do registrador estiver no banco de registradores e não pendente.
 };
 
-// Classe principal do simulador
+// Classe principal do simulador Tomasulo.
 class TomasuloSimulator
 {
 private:
-    // --- Componentes do Processador Simulado ---
-    vector<Instruction> instructions;      // Vetor contendo todas as instruções lidas do arquivo
-    vector<ReservationStation> addRS;      // Estações de Reserva para unidades de Adição/Subtração
-    vector<ReservationStation> mulRS;      // Estações de Reserva para unidades de Multiplicação/Divisão
-    vector<ReservationStation> loadRS;     // Estações de Reserva (Buffers de Load) para instruções LOAD
-    vector<ReservationStation> storeRS;    // Estações de Reserva (Buffers de Store) para instruções STORE
+    // --- Componentes Centrais do Processador Simulado ---
+    vector<Instruction> instructions;                         // Todas as instruções lidas do programa.
+    vector<ReservationStation> addRS, mulRS, loadRS, storeRS; // Estações de Reserva por tipo.
+    vector<ReorderBufferEntry> rob;                           // O Reorder Buffer.
+    map<string, int> registers;                               // Banco de registradores arquiteturais.
+    map<string, RegisterStatus> regStatus;                    // Tabela de status dos registradores.
+    int memory[1024];                                         // Memória principal simulada.
 
-    map<string, int> registers;            // Banco de Registradores (ex: "F0" -> valor_inteiro)
-    map<string, RegisterStatus> regStatus; // Tabela de Status dos Registradores (para renomeação)
+    // --- Controle da Simulação ---
+    int cycle = 0;                // Ciclo atual da simulação.
+    int nextInstructionIndex = 0; // Índice da próxima instrução a ser emitida.
+    int robHead = 0, robTail = 0; // Ponteiros para a cabeça e cauda do ROB (fila circular).
+    int robEntriesAvailable;      // Número de entradas livres no ROB.
 
-    int memory[1024]; // Memória simulada (array de inteiros)
-    int cycle;        // Contador do ciclo atual da simulação
-    int nextInstructionIndex; // Índice da próxima instrução a ser emitida (issue)
+    // --- Parâmetros de Configuração ---
+    const int ADD_LATENCY, MUL_LATENCY, DIV_LATENCY, LOAD_LATENCY, STORE_LATENCY;
+    const int ROB_SIZE;
 
-    // Latências das operações (em ciclos de clock)
-    // Definem quantos ciclos cada tipo de operação leva para executar após ter os operandos.
-    const int ADD_LATENCY = 2;
-    const int MUL_LATENCY = 10;
-    const int DIV_LATENCY = 40;
-    const int LOAD_LATENCY = 2;  // Latência para ler da memória (após endereço calculado)
-    const int STORE_LATENCY = 2; // Latência para escrever na memória (após endereço e dado disponíveis)
-
-    // Estrutura para rastrear instruções que estão atualmente em execução nas unidades funcionais
+    // --- Estruturas de Suporte para Execução ---
+    // Rastreia instruções atualmente nas unidades funcionais (após saírem da RS, antes do CDB).
     struct ExecutingInstruction
     {
-        int rsIndex;          // Índice da RS na sua respectiva lista (addRS, mulRS, etc.)
-        string rsType;        // Tipo da RS ("ADD", "MUL", "LOAD", "STORE")
-        int remainingCycles;  // Ciclos restantes para completar a execução
-        int instructionIndex; // Índice da instrução original
+        int rsIndex;
+        string rsType;
+        int remainingCycles;
+        int instructionIndex;
     };
+    vector<ExecutingInstruction> executingInstructions;
+    // Fila de instruções (índices originais) que completaram a execução e aguardam o CDB para escrever no ROB.
+    queue<int> completedForCDB;
 
-    vector<ExecutingInstruction> executingInstructions; // Lista de instruções em execução
-    queue<int> completedInstructions; // Fila de instruções cuja execução terminou e aguardam para escrever no CDB
-                                       // O CDB é um recurso compartilhado, geralmente apenas uma escrita por ciclo.
-
-    // Encontra uma estação de reserva livre para o tipo de instrução especificado.
-    // Retorna um par: {índice da RS livre, tipo da RS como string} ou {-1, ""} se nenhuma estiver livre.
+    // Encontra uma Estação de Reserva (RS) livre para um dado tipo de instrução.
     pair<int, string> findFreeRS(InstructionType type)
     {
         if (type == ADD || type == SUB)
         {
-            for (size_t i = 0; i < addRS.size(); i++)
-            {
+            for (size_t i = 0; i < addRS.size(); ++i)
                 if (!addRS[i].busy)
-                {
-                    return make_pair(static_cast<int>(i), "ADD");
-                }
-            }
+                    return {static_cast<int>(i), "ADD"};
         }
         else if (type == MUL || type == DIV)
         {
-            for (size_t i = 0; i < mulRS.size(); i++)
-            {
+            for (size_t i = 0; i < mulRS.size(); ++i)
                 if (!mulRS[i].busy)
-                {
-                    return make_pair(static_cast<int>(i), "MUL");
-                }
-            }
+                    return {static_cast<int>(i), "MUL"};
         }
         else if (type == LOAD)
         {
-            for (size_t i = 0; i < loadRS.size(); i++)
-            {
+            for (size_t i = 0; i < loadRS.size(); ++i)
                 if (!loadRS[i].busy)
-                {
-                    return make_pair(static_cast<int>(i), "LOAD");
-                }
-            }
+                    return {static_cast<int>(i), "LOAD"};
         }
         else if (type == STORE)
         {
-            for (size_t i = 0; i < storeRS.size(); i++)
-            {
+            for (size_t i = 0; i < storeRS.size(); ++i)
                 if (!storeRS[i].busy)
-                {
-                    return make_pair(static_cast<int>(i), "STORE");
-                }
-            }
+                    return {static_cast<int>(i), "STORE"};
         }
-
-        return make_pair(-1, ""); // Nenhuma RS livre encontrada
+        return {-1, ""}; // Nenhuma RS livre do tipo especificado.
     }
 
-    // Estágio de Emissão (Issue) do pipeline de Tomasulo.
-    // Tenta emitir a próxima instrução da fila para uma Estação de Reserva.
+    // Estágio de Emissão (Issue): aloca recursos (ROB, RS) e busca operandos.
     bool issueInstruction()
     {
-        // Verifica se todas as instruções já foram emitidas
-        if (nextInstructionIndex >= static_cast<int>(instructions.size()))
+        // Verifica se há instruções para emitir e se há espaço no ROB.
+        if (nextInstructionIndex >= static_cast<int>(instructions.size()) || robEntriesAvailable == 0)
         {
-            return false; // Nenhuma nova instrução para emitir
+            return false;
+        }
+        Instruction &originalInst = instructions[nextInstructionIndex]; // Próxima instrução do programa.
+
+        // Tenta encontrar uma RS livre.
+        pair<int, string> rsInfo = findFreeRS(originalInst.type);
+        if (rsInfo.first == -1)
+        {
+            return false; // Emperramento estrutural: sem RS livre.
         }
 
-        Instruction &inst = instructions[static_cast<size_t>(nextInstructionIndex)]; // Pega a próxima instrução
-        pair<int, string> result = findFreeRS(inst.type); // Tenta encontrar uma RS livre
-        int rsIndex = result.first;
-        string rsType = result.second;
+        // 1. Alocar entrada no ROB.
+        int currentRobIdx = robTail;
+        ReorderBufferEntry &robEntry = rob[currentRobIdx];
+        robEntry.busy = true;
+        robEntry.instructionIndex = nextInstructionIndex;
+        robEntry.type = originalInst.type;
+        robEntry.state = ROB_ISSUE;                                                           // Estado inicial no ROB.
+        robEntry.destinationRegister = (originalInst.type != STORE) ? originalInst.dest : ""; // STORE não tem reg. destino arquitetural.
+        robEntry.value = 0;
+        robEntry.address = 0;
+        robEntry.valueReady = false; // Inicializa campos.
 
-        // Se não houver RS livre, a instrução não pode ser emitida neste ciclo (emperramento estrutural)
-        if (rsIndex == -1)
-        {
-            return false; 
-        }
+        robTail = (robTail + 1) % ROB_SIZE; // Avança a cauda do ROB.
+        robEntriesAvailable--;
+        originalInst.issue = cycle; // Registra ciclo de emissão.
 
-        inst.issue = cycle; // Marca o ciclo de emissão da instrução
+        // 2. Preencher a Estação de Reserva (RS) alocada.
+        ReservationStation *rs = nullptr;
+        if (rsInfo.second == "ADD")
+            rs = &addRS[rsInfo.first];
+        else if (rsInfo.second == "MUL")
+            rs = &mulRS[rsInfo.first];
+        else if (rsInfo.second == "LOAD")
+            rs = &loadRS[rsInfo.first];
+        else if (rsInfo.second == "STORE")
+            rs = &storeRS[rsInfo.first];
+        // Não deve ser nullptr se rsInfo.first != -1.
 
-        ReservationStation *rs = NULL; // Ponteiro para a RS que será utilizada
-
-        // Obtém o ponteiro para a RS correta baseado no tipo
-        if (rsType == "ADD") rs = &addRS[static_cast<size_t>(rsIndex)];
-        else if (rsType == "MUL") rs = &mulRS[static_cast<size_t>(rsIndex)];
-        else if (rsType == "LOAD") rs = &loadRS[static_cast<size_t>(rsIndex)];
-        else if (rsType == "STORE") rs = &storeRS[static_cast<size_t>(rsIndex)];
-        
-        if (rs == NULL) return false; // Segurança, não deveria acontecer se rsIndex != -1
-
-        // Configura a Estação de Reserva com os dados da instrução
         rs->busy = true;
-        rs->op = inst.type;
+        rs->op = originalInst.type;
         rs->instructionIndex = nextInstructionIndex;
+        rs->destRobIndex = to_string(currentRobIdx); // A RS agora sabe para qual entrada do ROB deve enviar seu resultado.
 
-        // Lógica para buscar operandos e configurar campos Vj, Vk, Qj, Qk, A
-        if (inst.type == LOAD)
-        {
-            // Para LOAD:
-            // inst.dest é o registrador destino (ex: F2)
-            // inst.src1 é o offset (ex: "100")
-            // inst.src2 é o registrador base (ex: "F0")
-            rs->dest = inst.dest;             // Registrador onde o valor carregado será armazenado
-            rs->A = atoi(inst.src1.c_str());  // Offset para o cálculo do endereço
-
-            // Verifica o status do registrador base (inst.src2)
-            if (regStatus[inst.src2].busy) // Se o registrador base ainda não está pronto
-            {
-                rs->Qk = regStatus[inst.src2].reorderName; // Espera pela RS que produzirá o valor do reg. base
-            }
-            else
-            {
-                rs->Vk = registers[inst.src2]; // Valor do registrador base está disponível
-                rs->Qk = "";                   // Não precisa esperar
-            }
-            rs->Qj = ""; // LOAD não tem um primeiro operando de dados como ADD/SUB
+        // 3. Obter operandos (Vj, Vk) ou tags de dependência (Qj, Qk) para a RS.
+        // Operando 1 (Vj/Qj):
+        if (originalInst.type == LOAD)
+        { // Para LOAD, src1 é o offset, armazenado em 'A'.
+            rs->A = atoi(originalInst.src1.c_str());
+            rs->Vj = 0;
+            rs->Qj = ""; // Vj/Qj não são usados para um operando registrador em LOAD.
         }
-        else if (inst.type == STORE)
-        {
-            // Para STORE:
-            // inst.src1 é o registrador com o dado a ser armazenado (ex: F2)
-            // inst.dest é o offset (ex: "200") parseado de "offset(Rbase)"
-            // inst.src2 é o registrador base (ex: "F0") parseado de "offset(Rbase)"
-            rs->A = atoi(inst.dest.c_str()); // Offset para o cálculo do endereço. inst.dest aqui é o offset.
-            rs->dest = ""; // STORE não escreve em um registrador de destino no banco de registradores.
-                           // O "destino" é a memória. Este campo na RS pode ser ignorado ou usado para debug.
-
-            // Verifica o status do registrador de dados (inst.src1)
-            if (regStatus[inst.src1].busy)
-            {
-                rs->Qj = regStatus[inst.src1].reorderName; // Espera pela RS que produzirá o dado
+        else
+        { // Para ADD, SUB, MUL, DIV (src1 é registrador) e STORE (src1 é registrador do dado).
+            if (!originalInst.src1.empty())
+            { // Verifica se src1 existe (pode não existir para algumas arquiteturas/instruções)
+                if (regStatus[originalInst.src1].busy)
+                { // Se o valor de src1 está pendente.
+                    int producingRobIdx = regStatus[originalInst.src1].robIndex;
+                    // Verifica se o valor já está pronto na entrada do ROB que o produzirá.
+                    if (rob[producingRobIdx].busy && rob[producingRobIdx].state == ROB_WRITERESULT && rob[producingRobIdx].valueReady)
+                    {
+                        rs->Vj = rob[producingRobIdx].value; // Pega valor direto do ROB.
+                        rs->Qj = "";
+                    }
+                    else
+                    {
+                        rs->Qj = to_string(producingRobIdx); // Armazena a tag do ROB que fornecerá o valor.
+                    }
+                }
+                else
+                { // Valor de src1 está disponível no banco de registradores.
+                    rs->Vj = registers[originalInst.src1];
+                    rs->Qj = "";
+                }
             }
             else
             {
-                rs->Vj = registers[inst.src1]; // Dado está disponível
+                rs->Vj = 0;
                 rs->Qj = "";
-            }
+            } // Sem src1
+        }
 
-            // Verifica o status do registrador base (inst.src2)
-            if (regStatus[inst.src2].busy)
-            {
-                rs->Qk = regStatus[inst.src2].reorderName; // Espera pela RS que produzirá o valor do reg. base
+        // Operando 2 (Vk/Qk): src2 para Arith; Registrador Base para Load/Store.
+        if (originalInst.type == ADD || originalInst.type == SUB || originalInst.type == MUL || originalInst.type == DIV ||
+            originalInst.type == LOAD || originalInst.type == STORE)
+        { // Instruções que podem ter src2.
+            if (!originalInst.src2.empty())
+            { // Verifica se src2 (registrador) existe.
+                if (regStatus[originalInst.src2].busy)
+                {
+                    int producingRobIdx = regStatus[originalInst.src2].robIndex;
+                    if (rob[producingRobIdx].busy && rob[producingRobIdx].state == ROB_WRITERESULT && rob[producingRobIdx].valueReady)
+                    {
+                        rs->Vk = rob[producingRobIdx].value;
+                        rs->Qk = "";
+                    }
+                    else
+                    {
+                        rs->Qk = to_string(producingRobIdx);
+                    }
+                }
+                else
+                {
+                    rs->Vk = registers[originalInst.src2];
+                    rs->Qk = "";
+                }
             }
             else
-            {
-                rs->Vk = registers[inst.src2]; // Valor do registrador base está disponível
+            {               // Sem src2 explícito (ex: L.D F1, 100() implicaria base 0 ou erro).
+                rs->Vk = 0; // Se src2 vazio, assume-se valor 0 para base (ou deveria ser erro de formato).
                 rs->Qk = "";
             }
         }
-        else // Para instruções aritméticas (ADD, SUB, MUL, DIV)
+        else
         {
-            rs->dest = inst.dest; // Registrador de destino da operação aritmética
+            rs->Vk = 0;
+            rs->Qk = "";
+        } // Instruções sem src2.
 
-            // Verifica o status do primeiro operando fonte (inst.src1)
-            if (regStatus[inst.src1].busy)
-            {
-                rs->Qj = regStatus[inst.src1].reorderName; // Espera pela RS que produzirá Vj
-            }
-            else
-            {
-                rs->Vj = registers[inst.src1]; // Valor de src1 está disponível
-                rs->Qj = "";
-            }
-
-            // Verifica o status do segundo operando fonte (inst.src2)
-            if (regStatus[inst.src2].busy)
-            {
-                rs->Qk = regStatus[inst.src2].reorderName; // Espera pela RS que produzirá Vk
-            }
-            else
-            {
-                rs->Vk = registers[inst.src2]; // Valor de src2 está disponível
-                rs->Qk = "";
+        // Tratamento específico para STORE no momento do Issue:
+        if (originalInst.type == STORE)
+        {
+            rs->A = atoi(originalInst.dest.c_str()); // Para STORE, inst.dest (parseado do offset(base)) é o offset.
+            // Se o valor a ser armazenado (Vj, que veio de inst.src1) já está disponível na RS,
+            // pode-se já preencher o campo 'value' e 'valueReady' na entrada do ROB do STORE.
+            if (rs->Qj.empty())
+            {                                      // Se Vj (dado do store) está pronto.
+                rob[currentRobIdx].value = rs->Vj; // 'value' na ROB do STORE é o dado a ser escrito.
+                rob[currentRobIdx].valueReady = true;
             }
         }
 
-        // Atualiza o status do registrador de destino (renomeação de registrador)
-        // Exceto para STORE, que não escreve em um registrador de destino.
-        // O registrador de destino agora apontará para esta RS.
-        if (inst.type != STORE)
+        // 4. Atualizar Tabela de Status do Registrador de Destino (Renomeação).
+        // Se a instrução tem um registrador de destino (não é STORE),
+        // marca o registrador como 'busy' e aponta para a entrada do ROB que calculará seu novo valor.
+        if (originalInst.type != STORE)
         {
-            regStatus[inst.dest].busy = true;
-            stringstream ss; // Usado para converter o índice da RS (int) para string
-            ss << rsIndex;
-            regStatus[inst.dest].reorderName = rsType + ss.str(); // Tag da RS (ex: "ADD0", "LOAD2")
+            regStatus[originalInst.dest].busy = true;
+            regStatus[originalInst.dest].robIndex = currentRobIdx;
         }
 
-        nextInstructionIndex++; // Avança para a próxima instrução a ser emitida
+        nextInstructionIndex++;
         return true;
     }
 
-    
-    // Verifica estacoes prontas para execucao e inicia execucao
+    // Inicia a execução de instruções nas RSs cujos operandos (Vj, Vk) estão prontos (Qj, Qk vazios).
     void startExecution()
     {
-        // Verifica ADD/SUB
-        for (size_t i = 0; i < addRS.size(); i++)
-        {
-            if (addRS[i].busy && addRS[i].Qj.empty() && addRS[i].Qk.empty())
-            {
-                bool alreadyExecuting = false;
+        ReservationStation *rs_arrays[] = {addRS.data(), mulRS.data(), loadRS.data(), storeRS.data()};
+        size_t rs_sizes[] = {addRS.size(), mulRS.size(), loadRS.size(), storeRS.size()};
+        string rs_types[] = {"ADD", "MUL", "LOAD", "STORE"};
+        int base_latencies[] = {ADD_LATENCY, 0, LOAD_LATENCY, STORE_LATENCY}; // Latência de MUL/DIV é especial.
 
-                // Verifica se ja esta executando
-                for (size_t j = 0; j < executingInstructions.size(); j++)
+        for (int type_idx = 0; type_idx < 4; ++type_idx)
+        { // Itera sobre os tipos de RS
+            for (size_t i = 0; i < rs_sizes[type_idx]; ++i)
+            { // Itera sobre cada RS daquele tipo
+                ReservationStation &currentRS = rs_arrays[type_idx][i];
+                // Verifica se a RS está ocupada e se todos os operandos estão prontos.
+                if (currentRS.busy && currentRS.Qj.empty() && currentRS.Qk.empty())
                 {
-                    if (executingInstructions[j].rsType == "ADD" && executingInstructions[j].rsIndex == static_cast<int>(i))
+                    bool alreadyExecuting = false;
+                    // Verifica se a instrução desta RS já não está na lista de execução.
+                    for (const auto &execInst : executingInstructions)
                     {
-                        alreadyExecuting = true;
-                        break;
-                    }
-                }
-
-                if (!alreadyExecuting)
-                {
-                    ExecutingInstruction exec;
-                    exec.rsIndex = static_cast<int>(i);
-                    exec.rsType = "ADD";
-                    exec.instructionIndex = addRS[i].instructionIndex;
-
-                    // Define latência baseada no tipo de operacao
-                    if (addRS[i].op == ADD || addRS[i].op == SUB)
-                    {
-                        exec.remainingCycles = ADD_LATENCY;
+                        if (execInst.rsType == rs_types[type_idx] && execInst.rsIndex == static_cast<int>(i))
+                        {
+                            alreadyExecuting = true;
+                            break;
+                        }
                     }
 
-                    executingInstructions.push_back(exec);
-                }
-            }
-        }
+                    if (!alreadyExecuting)
+                    {                                                     // Se não está executando, pode iniciar.
+                        int robIdxForInst = stoi(currentRS.destRobIndex); // Pega o índice do ROB associado.
+                        // Atualiza o estado da instrução no ROB para EXECUTE, se a entrada do ROB ainda for relevante.
+                        if (rob[robIdxForInst].busy && rob[robIdxForInst].state == ROB_ISSUE)
+                        {
+                            rob[robIdxForInst].state = ROB_EXECUTE;
+                        }
 
-        // Verifica MUL/DIV
-        for (size_t i = 0; i < mulRS.size(); i++)
-        {
-            if (mulRS[i].busy && mulRS[i].Qj.empty() && mulRS[i].Qk.empty())
-            {
-                bool alreadyExecuting = false;
+                        ExecutingInstruction exec; // Cria uma nova entrada para a lista de instruções em execução.
+                        exec.rsIndex = i;
+                        exec.rsType = rs_types[type_idx];
+                        exec.instructionIndex = currentRS.instructionIndex;
 
-                // Verifica se ja esta executando
-                for (size_t j = 0; j < executingInstructions.size(); j++)
-                {
-                    if (executingInstructions[j].rsType == "MUL" && executingInstructions[j].rsIndex == static_cast<int>(i))
-                    {
-                        alreadyExecuting = true;
-                        break;
+                        // Define a latência correta.
+                        if (rs_types[type_idx] == "MUL")
+                        { // MUL e DIV usam a mesma RS.
+                            exec.remainingCycles = (currentRS.op == MUL) ? MUL_LATENCY : DIV_LATENCY;
+                        }
+                        else
+                        {
+                            exec.remainingCycles = base_latencies[type_idx];
+                        }
+                        executingInstructions.push_back(exec);
+
+                        // Para STORE: se o valor (Vj) se tornou pronto agora (Qj foi resolvido por um WriteBack anterior),
+                        // e a instrução está começando a execução (Qk também resolvido),
+                        // atualiza a entrada do ROB do STORE com o valor e marca como pronto.
+                        if (currentRS.op == STORE && rob[robIdxForInst].busy && !rob[robIdxForInst].valueReady)
+                        {
+                            rob[robIdxForInst].value = currentRS.Vj; // Vj deve estar pronto aqui.
+                            rob[robIdxForInst].valueReady = true;
+                        }
                     }
-                }
-
-                if (!alreadyExecuting)
-                {
-                    ExecutingInstruction exec;
-                    exec.rsIndex = static_cast<int>(i);
-                    exec.rsType = "MUL";
-                    exec.instructionIndex = mulRS[i].instructionIndex;
-
-                    // Define latência baseada no tipo de operacao
-                    if (mulRS[i].op == MUL)
-                    {
-                        exec.remainingCycles = MUL_LATENCY;
-                    }
-                    else if (mulRS[i].op == DIV)
-                    {
-                        exec.remainingCycles = DIV_LATENCY;
-                    }
-
-                    executingInstructions.push_back(exec);
-                }
-            }
-        }
-
-        // Verifica LOAD
-        for (size_t i = 0; i < loadRS.size(); i++)
-        {
-            if (loadRS[i].busy && loadRS[i].Qj.empty() && loadRS[i].Qk.empty())
-            {
-                bool alreadyExecuting = false;
-
-                // Verifica se ja esta executando
-                for (size_t j = 0; j < executingInstructions.size(); j++)
-                {
-                    if (executingInstructions[j].rsType == "LOAD" && executingInstructions[j].rsIndex == static_cast<int>(i))
-                    {
-                        alreadyExecuting = true;
-                        break;
-                    }
-                }
-
-                if (!alreadyExecuting)
-                {
-                    ExecutingInstruction exec;
-                    exec.rsIndex = static_cast<int>(i);
-                    exec.rsType = "LOAD";
-                    exec.instructionIndex = loadRS[i].instructionIndex;
-                    exec.remainingCycles = LOAD_LATENCY;
-
-                    executingInstructions.push_back(exec);
-                }
-            }
-        }
-
-        // Verifica STORE
-        for (size_t i = 0; i < storeRS.size(); i++)
-        {
-            if (storeRS[i].busy && storeRS[i].Qj.empty() && storeRS[i].Qk.empty())
-            {
-                bool alreadyExecuting = false;
-
-                // Verifica se ja esta executando
-                for (size_t j = 0; j < executingInstructions.size(); j++)
-                {
-                    if (executingInstructions[j].rsType == "STORE" && executingInstructions[j].rsIndex == static_cast<int>(i))
-                    {
-                        alreadyExecuting = true;
-                        break;
-                    }
-                }
-
-                if (!alreadyExecuting)
-                {
-                    ExecutingInstruction exec;
-                    exec.rsIndex = static_cast<int>(i);
-                    exec.rsType = "STORE";
-                    exec.instructionIndex = storeRS[i].instructionIndex;
-                    exec.remainingCycles = STORE_LATENCY;
-
-                    executingInstructions.push_back(exec);
                 }
             }
         }
     }
 
-    // Estágio de Execução (Execute) - Avanço da Execução
-    // Para todas as instruções que estão na lista 'executingInstructions',
-    // decrementa o contador de ciclos restantes.
+    // Avança a execução das instruções que estão nas unidades funcionais.
     void advanceExecution()
     {
-        for (size_t i = 0; i < executingInstructions.size(); /* i é incrementado manualmente ou não */)
+        for (size_t i = 0; i < executingInstructions.size(); /* não incrementa aqui ao apagar */)
         {
-            executingInstructions[i].remainingCycles--; // Decrementa ciclo restante
-
-            if (executingInstructions[i].remainingCycles <= 0) // Execução concluída?
-            {
-                // Marca o ciclo de conclusão da execução na estrutura da instrução original
-                instructions[static_cast<size_t>(executingInstructions[i].instructionIndex)].execComp = cycle;
-
-                // Adiciona à fila de instruções que completaram a execução e aguardam o CDB
-                completedInstructions.push(executingInstructions[i].instructionIndex);
-
-                // Remove da lista de instruções em execução
-                // Ao remover um elemento de um vetor pelo índice, o tamanho do vetor muda
-                // e os elementos subsequentes são deslocados. Por isso, não incrementamos 'i' aqui.
-                executingInstructions.erase(executingInstructions.begin() + static_cast<long>(i));
+            executingInstructions[i].remainingCycles--; // Decrementa ciclos restantes.
+            if (executingInstructions[i].remainingCycles <= 0)
+            { // Se a execução terminou.
+                // Registra o ciclo de conclusão da execução.
+                instructions[executingInstructions[i].instructionIndex].execComp = cycle;
+                // Adiciona à fila para escrita no CDB/ROB no próximo ciclo.
+                completedForCDB.push(executingInstructions[i].instructionIndex);
+                // Remove da lista de instruções em execução.
+                executingInstructions.erase(executingInstructions.begin() + i);
             }
             else
             {
-                i++; // Avança para a próxima instrução em execução se esta não terminou
+                i++; // Próxima instrução em execução.
             }
         }
     }
 
-    // Estágio de Escrita do Resultado (Write Result / Write Back)
-    // Processa uma instrução da fila 'completedInstructions' por ciclo (simulando um CDB).
-    // O resultado é escrito no banco de registradores (se aplicável) e transmitido
-    // para todas as RSs que possam estar esperando por este resultado.
+    // Processa resultados do CDB: escreve na entrada do ROB e encaminha para RSs dependentes.
     void processWriteBack()
     {
-        if (completedInstructions.empty()) // Se não há instruções completas para escrever
-        {
-            return;
-        }
+        if (completedForCDB.empty())
+            return; // Nada a fazer se a fila do CDB está vazia.
 
-        int instIndex = completedInstructions.front(); // Pega a primeira instrução da fila (FIFO)
-        completedInstructions.pop();                   // Remove da fila
+        int originalInstIndex = completedForCDB.front(); // Pega a próxima instrução da fila.
+        completedForCDB.pop();
 
-        Instruction &inst = instructions[static_cast<size_t>(instIndex)]; // Referência para a instrução original
-        inst.writeResult = cycle; // Marca o ciclo em que o resultado foi escrito
+        Instruction &inst = instructions[originalInstIndex];
+        // Registra o ciclo em que o resultado é escrito no ROB (via CDB).
+        inst.writeResult = cycle;
 
-        ReservationStation *rs = NULL; // Ponteiro para a RS que executou a instrução
-        string rsName;                 // Nome da RS (tag, ex: "ADD0") que produziu o resultado
+        ReservationStation *rs = nullptr;
+        string robIndexStr; // String contendo o índice do ROB de destino desta RS.
 
-        // Encontra a RS correspondente à instrução que completou
-        // (Este bloco poderia ser otimizado se a RS soubesse seu próprio nome completo ou
-        //  se a informação da RS estivesse mais diretamente ligada à 'completedInstructions')
-        // Primeiro, procura em addRS
-        for (size_t i = 0; i < addRS.size(); i++)
-        {
-            if (addRS[i].busy && addRS[i].instructionIndex == instIndex)
-            {
-                rs = &addRS[i];
-                stringstream ss; ss << i; rsName = "ADD" + ss.str();
-                break;
-            }
-        }
-        // Se não encontrou, procura em mulRS
-        if (rs == NULL)
-        {
-            for (size_t i = 0; i < mulRS.size(); i++)
-            {
-                if (mulRS[i].busy && mulRS[i].instructionIndex == instIndex)
+        // Encontra a RS que originou esta instrução e o índice do ROB associado.
+        bool found_rs = false;
+        if (!found_rs)
+            for (size_t i = 0; i < addRS.size(); ++i)
+                if (addRS[i].instructionIndex == originalInstIndex && addRS[i].busy)
+                {
+                    rs = &addRS[i];
+                    robIndexStr = rs->destRobIndex;
+                    found_rs = true;
+                    break;
+                }
+        if (!found_rs)
+            for (size_t i = 0; i < mulRS.size(); ++i)
+                if (mulRS[i].instructionIndex == originalInstIndex && mulRS[i].busy)
                 {
                     rs = &mulRS[i];
-                    stringstream ss; ss << i; rsName = "MUL" + ss.str();
+                    robIndexStr = rs->destRobIndex;
+                    found_rs = true;
                     break;
                 }
-            }
-        }
-        // Se não encontrou, procura em loadRS
-        if (rs == NULL)
-        {
-            for (size_t i = 0; i < loadRS.size(); i++)
-            {
-                if (loadRS[i].busy && loadRS[i].instructionIndex == instIndex)
+        if (!found_rs)
+            for (size_t i = 0; i < loadRS.size(); ++i)
+                if (loadRS[i].instructionIndex == originalInstIndex && loadRS[i].busy)
                 {
                     rs = &loadRS[i];
-                    stringstream ss; ss << i; rsName = "LOAD" + ss.str();
+                    robIndexStr = rs->destRobIndex;
+                    found_rs = true;
                     break;
                 }
-            }
-        }
-        // Se não encontrou, procura em storeRS
-        if (rs == NULL)
-        {
-            for (size_t i = 0; i < storeRS.size(); i++)
-            {
-                if (storeRS[i].busy && storeRS[i].instructionIndex == instIndex)
+        if (!found_rs)
+            for (size_t i = 0; i < storeRS.size(); ++i)
+                if (storeRS[i].instructionIndex == originalInstIndex && storeRS[i].busy)
                 {
                     rs = &storeRS[i];
-                    stringstream ss; ss << i; rsName = "STORE" + ss.str();
+                    robIndexStr = rs->destRobIndex;
+                    found_rs = true;
                     break;
                 }
-            }
-        }
 
-        // Se, por algum motivo, a RS não for encontrada, é um erro.
-        if (rs == NULL)
+        if (rs == nullptr || robIndexStr.empty())
         {
-            cerr << "Erro: Nao foi possivel encontrar a estacao de reserva para a instrucao " << instIndex << endl;
+            // Pode acontecer se a instrução já foi cometida ou invalidada (ex: desvio não previsto).
+            // Para este simulador, pode ser um sinal de erro ou de uma condição de corrida sutil.
+            // cout << "Alerta no WriteBack: RS para inst " << originalInstIndex << " não encontrada ou robIndexStr vazio (possivelmente já cometida)." << endl;
+            return;
+        }
+        int producingRobIdx = stoi(robIndexStr); // Converte a string do índice do ROB para inteiro.
+
+        int resultData = 0;    // Para resultados de ALU e LOAD.
+        int effectiveAddr = 0; // Para endereços de LOAD/STORE.
+
+        // Calcula o resultado ou endereço e prepara para atualizar o ROB.
+        switch (inst.type)
+        {
+        case ADD:
+            resultData = rs->Vj + rs->Vk;
+            break;
+        case SUB:
+            resultData = rs->Vj - rs->Vk;
+            break;
+        case MUL:
+            resultData = rs->Vj * rs->Vk;
+            break;
+        case DIV:
+            if (rs->Vk != 0)
+                resultData = rs->Vj / rs->Vk;
+            else
+            {
+                cerr << "Erro: Divisao por zero na instrucao " << originalInstIndex << "!" << endl;
+                resultData = 0;
+            }
+            break;
+        case LOAD:
+            effectiveAddr = rs->A + rs->Vk; // A é offset, Vk é valor do registrador base.
+            if (effectiveAddr >= 0 && effectiveAddr < 1024)
+                resultData = memory[effectiveAddr];
+            else
+            {
+                cerr << "Erro: Endereco de LOAD invalido (" << effectiveAddr << ") para inst " << originalInstIndex << endl;
+                resultData = 0;
+            } // Tratar erro de acesso.
+            rob[producingRobIdx].address = effectiveAddr; // Armazena o endereço calculado no ROB.
+            break;
+        case STORE:
+            effectiveAddr = rs->A + rs->Vk;
+            rob[producingRobIdx].address = effectiveAddr; // Armazena o endereço calculado no ROB.
+            // O valor a ser armazenado (rs->Vj) já deve estar em rob[producingRobIdx].value
+            // e rob[producingRobIdx].valueReady deve ser true, se o dado estava pronto.
+            // Se o dado dependia de outra instrução, updateDependentRS terá atualizado o ROB.
+            resultData = rs->Vj; // O valor do STORE (Vj) é "transmitido" para sua própria entrada no ROB.
+            break;
+        case INVALID:
+            cerr << "Erro: Instrução inválida no WriteBack para índice " << originalInstIndex << endl;
+            resultData = 0;
             return;
         }
 
-        int resultValue = 0; // Valor do resultado calculado/carregado
-        int effectiveAddress = 0; // Endereço efetivo para L/S
+        // Atualiza a entrada do ROB com o resultado/valor e estado.
+        if (rob[producingRobIdx].busy)
+        {                                                 // Verifica se a entrada do ROB ainda é relevante.
+            rob[producingRobIdx].value = resultData;      // Armazena o resultado/dado.
+            rob[producingRobIdx].valueReady = true;       // Marca que o valor está pronto.
+            rob[producingRobIdx].state = ROB_WRITERESULT; // Pronta para commit.
 
-        // Calcula o resultado da operação ou realiza acesso à memória
-        switch (inst.type)
-        {
-        case ADD: resultValue = rs->Vj + rs->Vk; break;
-        case SUB: resultValue = rs->Vj - rs->Vk; break;
-        case MUL: resultValue = rs->Vj * rs->Vk; break;
-        case DIV:
-            if (rs->Vk != 0) resultValue = rs->Vj / rs->Vk;
-            else { cerr << "Erro: Divisao por zero na instrucao " << instIndex << "!" << endl; resultValue = 0; }
-            break;
-        case LOAD:
-            effectiveAddress = rs->A + rs->Vk; // Endereço = offset (A) + valor_reg_base (Vk)
-            // Adicionar verificação de limites da memória se necessário: if (effectiveAddress >=0 && effectiveAddress < 1024)
-            resultValue = memory[effectiveAddress];
-            break;
-        case STORE:
-            effectiveAddress = rs->A + rs->Vk; // Endereço = offset (A) + valor_reg_base (Vk)
-            // Adicionar verificação de limites da memória se necessário
-            memory[effectiveAddress] = rs->Vj; // Armazena o valor Vj (dado) na memória
-            // STORE não produz um 'resultValue' para registradores
-            break;
-        default: break; // Caso inválido
+            // Transmite o resultado (valor e ÍNDICE DO ROB que o produziu) para RSs dependentes.
+            updateDependentRS(producingRobIdx, resultData);
         }
 
-        // Atualiza o banco de registradores e o status do registrador
-        // Apenas para instruções que têm um registrador de destino (não STORE).
-        if (inst.type != STORE)
-        {
-            registers[rs->dest] = resultValue; // Escreve o resultado no registrador de destino
-
-            // Libera o status do registrador se esta RS era a que estava designada a escrever nele
-            if (regStatus[rs->dest].reorderName == rsName)
-            {
-                regStatus[rs->dest].busy = false;
-                regStatus[rs->dest].reorderName = "";
-            }
-        }
-
-        // Transmite o resultado (resultValue e rsName) para todas as outras RSs
-        // que possam estar esperando por ele (forwarding / wakeup).
-        // Apenas se a instrução não for STORE, pois STORE não produz resultado para outras RSs esperarem.
-        if (inst.type != STORE) {
-             updateDependentRS(rsName, resultValue);
-        }
-        // Para STORE, mesmo que não haja 'resultValue' para registradores, 
-        // se uma futura instrução L.D dependesse da escrita de S.D (memory disambiguation),
-        // uma sinalização mais complexa seria necessária. Este simulador não trata essa dependência memória-memória.
-
-        rs->busy = false; // Libera a Estação de Reserva
-        rs->instructionIndex = -1; // Reseta o índice da instrução
-        // Opcional: resetar outros campos da RS (Vj, Vk, Qj, Qk, A, dest) para um estado limpo
-        rs->Qj = ""; rs->Qk = ""; rs->Vj = 0; rs->Vk = 0; rs->A = 0; rs->dest = "";
+        // Libera a Estação de Reserva.
+        rs->busy = false;
+        rs->instructionIndex = -1;
+        rs->Qj = "";
+        rs->Qk = "";
+        rs->Vj = 0;
+        rs->Vk = 0;
+        rs->A = 0;
+        rs->destRobIndex = "";
     }
 
-    // Atualiza todas as Estações de Reserva que estavam esperando por um resultado
-    // que acabou de ser disponibilizado no CDB.
-    // rsName: nome da RS que produziu o resultado (ex: "ADD0").
-    // result: o valor do resultado.
-    void updateDependentRS(const string &producingRSName, int resultValue)
+    // Atualiza Estações de Reserva que aguardam um resultado que foi disponibilizado no CDB (originado de uma entrada do ROB).
+    void updateDependentRS(int producingRobIdx, int resultValue)
     {
-        // Itera por todas as estações de reserva de todos os tipos
-        vector<ReservationStation>* rs_lists[] = {&addRS, &mulRS, &loadRS, &storeRS};
-        for (auto& rs_list_ptr : rs_lists) {
-            for (size_t i = 0; i < rs_list_ptr->size(); ++i) {
-                ReservationStation& currentRS = (*rs_list_ptr)[i];
-                if (currentRS.busy) { // Apenas se a RS estiver ocupada
-                    // Verifica se o primeiro operando (Qj) estava esperando por este resultado
-                    if (currentRS.Qj == producingRSName) {
-                        currentRS.Vj = resultValue; // Recebe o valor
-                        currentRS.Qj = "";          // Não precisa mais esperar por Qj
+        string producingTag = to_string(producingRobIdx); // Tag do ROB que produziu o resultado.
+        ReservationStation *rs_arrays[] = {addRS.data(), mulRS.data(), loadRS.data(), storeRS.data()};
+        size_t rs_sizes[] = {addRS.size(), mulRS.size(), loadRS.size(), storeRS.size()};
+
+        for (int type_idx = 0; type_idx < 4; ++type_idx)
+        { // Itera sobre os tipos de RS.
+            for (size_t i = 0; i < rs_sizes[type_idx]; ++i)
+            { // Itera sobre cada RS.
+                ReservationStation &currentRS = rs_arrays[type_idx][i];
+                if (currentRS.busy)
+                { // Se a RS está ocupada.
+                    // Se o operando Qj estava esperando por esta tag do ROB.
+                    if (currentRS.Qj == producingTag)
+                    {
+                        currentRS.Vj = resultValue; // Recebe o valor.
+                        currentRS.Qj = "";          // Limpa a tag de espera.
+                        // Caso especial: se esta RS é de um STORE e Qj era o operando de DADO,
+                        // o valor precisa ser propagado para a entrada do ROB do STORE.
+                        if (currentRS.op == STORE)
+                        {
+                            int storeOwnRobIdx = stoi(currentRS.destRobIndex); // Índice do ROB do próprio STORE.
+                            if (rob[storeOwnRobIdx].busy)
+                            {                                            // Verifica se a entrada do ROB ainda é relevante.
+                                rob[storeOwnRobIdx].value = resultValue; // Atualiza o valor a ser armazenado.
+                                rob[storeOwnRobIdx].valueReady = true;   // Marca que o dado está pronto.
+                            }
+                        }
                     }
-                    // Verifica se o segundo operando (Qk) estava esperando por este resultado
-                    if (currentRS.Qk == producingRSName) {
-                        currentRS.Vk = resultValue; // Recebe o valor
-                        currentRS.Qk = "";          // Não precisa mais esperar por Qk
+                    // Se o operando Qk estava esperando por esta tag do ROB.
+                    if (currentRS.Qk == producingTag)
+                    {
+                        currentRS.Vk = resultValue; // Recebe o valor.
+                        currentRS.Qk = "";          // Limpa a tag de espera.
                     }
                 }
             }
+        }
+    }
+
+    // Estágio de Commit: Efetiva o resultado da instrução na cabeça do ROB no estado arquitetural.
+    // Garante a terminação em ordem.
+    void commitInstruction()
+    {
+        // Não faz nada se o ROB estiver vazio ou se a entrada na cabeça não estiver ocupada.
+        if (robEntriesAvailable == ROB_SIZE || !rob[robHead].busy)
+            return;
+
+        ReorderBufferEntry &headEntry = rob[robHead]; // Referência para a entrada na cabeça do ROB.
+
+        // Só pode cometer se o resultado da instrução está pronto no ROB (estado ROB_WRITERESULT).
+        if (headEntry.state == ROB_WRITERESULT)
+        {
+            // Para STOREs, uma condição adicional: o valor a ser armazenado DEVE estar pronto.
+            if (headEntry.type == STORE && !headEntry.valueReady)
+            {
+                // Se um STORE está na cabeça do ROB, mas seu dado ainda não está pronto,
+                // ele bloqueia o commit de todas as instruções subsequentes.
+                // Este é um ponto importante para a correção de STOREs.
+                return;
+            }
+
+            Instruction &originalInst = instructions[headEntry.instructionIndex];
+            originalInst.commitCycle = cycle; // Registra o ciclo de commit.
+
+            string committedActionLog; // Para a mensagem de log do commit.
+
+            // Efetiva a escrita no estado arquitetural (registradores ou memória).
+            if (headEntry.type != STORE)
+            { // Para ADD, SUB, MUL, DIV, LOAD
+                registers[headEntry.destinationRegister] = headEntry.value;
+                committedActionLog = headEntry.destinationRegister + " = " + to_string(headEntry.value);
+                // Libera o RegisterStatus se esta entrada do ROB era a última fonte para este registrador.
+                if (regStatus[headEntry.destinationRegister].busy &&
+                    regStatus[headEntry.destinationRegister].robIndex == robHead)
+                {
+                    regStatus[headEntry.destinationRegister].busy = false;
+                    regStatus[headEntry.destinationRegister].robIndex = -1;
+                }
+            }
+            else
+            { // Para STORE
+                // Verifica se o endereço é válido antes de escrever na memória.
+                if (headEntry.address >= 0 && headEntry.address < 1024)
+                {
+                    memory[headEntry.address] = headEntry.value;
+                    committedActionLog = "MEM[" + to_string(headEntry.address) + "] = " + to_string(headEntry.value);
+                }
+                else
+                {
+                    cerr << "Erro CRITICO no Commit: Endereco de STORE invalido: " << headEntry.address << " para inst " << headEntry.instructionIndex << endl;
+                    committedActionLog = "STORE ERRO - Endereco Invalido";
+                    // O que fazer aqui? Parar simulação? Marcar erro?
+                    // Por ora, a instrução será "cometida" (ROB liberado) mas com erro.
+                }
+            }
+
+            // Log da ação de commit.
+            cout << "Ciclo " << cycle << ": Commit Inst " << headEntry.instructionIndex << " (ROB " << robHead << "): " << committedActionLog << endl;
+
+            // Libera a entrada do ROB.
+            headEntry.busy = false;
+            headEntry.state = ROB_EMPTY;        // Marca como vazia para reutilização.
+            robHead = (robHead + 1) % ROB_SIZE; // Avança a cabeça do ROB.
+            robEntriesAvailable++;
         }
     }
 
 public:
-    // Construtor do Simulador Tomasulo
-    // Inicializa as contagens de RS, registradores e memória.
-    TomasuloSimulator(int addRSCount = 3, int mulRSCount = 2, int loadRSCount = 3, int storeRSCount = 3)
+    // Construtor: inicializa o simulador com contagens de RS e tamanho do ROB.
+    TomasuloSimulator(int addRSCount = 3, int mulRSCount = 2, int loadRSCount = 3, int storeRSCount = 3, int rob_s = 16) : ADD_LATENCY(2), MUL_LATENCY(10), DIV_LATENCY(40), LOAD_LATENCY(2), STORE_LATENCY(2), // Inicializa consts
+                                                                                                                           ROB_SIZE(rob_s), rob(rob_s)                                                          // Inicializa o ROB com o tamanho passado ou padrão.
     {
-        // Inicializa o número especificado de estações de reserva para cada tipo
-        addRS.resize(static_cast<size_t>(addRSCount));
-        mulRS.resize(static_cast<size_t>(mulRSCount));
-        loadRS.resize(static_cast<size_t>(loadRSCount));
-        storeRS.resize(static_cast<size_t>(storeRSCount));
+        addRS.resize(addRSCount);
+        mulRS.resize(mulRSCount);
+        loadRS.resize(loadRSCount);
+        storeRS.resize(storeRSCount);
+        robHead = 0;
+        robTail = 0;
+        robEntriesAvailable = ROB_SIZE;
 
-        // Inicializa os registradores (F0-F31) com um valor padrão (10)
-        // e seus status como não-ocupados.
+        // Inicializa registradores (F0-F31) com valor 10 e status livre.
         for (int i = 0; i < 32; i++)
         {
-            stringstream ss;
-            ss << "F" << i; // Cria o nome do registrador (F0, F1, ...)
-            string regName = ss.str();
-            registers[regName] = 10; // Valor inicial
-            regStatus[regName] = RegisterStatus(); // Status inicial (não ocupado)
+            string regName = "F" + to_string(i);
+            registers[regName] = 10;
+            regStatus[regName] = RegisterStatus();
         }
-
-        // Inicializa a memória com valores (ex: memory[i] = i) para facilitar testes
+        // Inicializa memória com valores previsíveis (memory[i] = i).
         for (int i = 0; i < 1024; i++)
-        {
             memory[i] = i;
-        }
-
-        cycle = 0;                // Inicia a simulação no ciclo 0
-        nextInstructionIndex = 0; // Começa emitindo a primeira instrução (índice 0)
+        cycle = 0;
+        nextInstructionIndex = 0;
     }
 
-    // Carrega as instruções de um arquivo de texto.
-    // Retorna true se bem-sucedido, false caso contrário.
+    // Carrega instruções de um arquivo.
     bool loadInstructions(const string &filename)
     {
-        ifstream file(filename.c_str()); // Abre o arquivo para leitura
+        ifstream file(filename.c_str());
         if (!file.is_open())
         {
             cerr << "Erro ao abrir arquivo: " << filename << endl;
             return false;
         }
-
         string line;
-        // Lê o arquivo linha por linha
         while (getline(file, line))
         {
-            // Ignora linhas vazias ou comentários (iniciadas com '#')
             if (line.empty() || line[0] == '#')
-            {
-                continue;
-            }
+                continue; // Ignora vazias e comentários.
+            istringstream iss(line);
+            string op, p1, p2, p3; // Tokens temporários para parsing.
+            iss >> op >> p1;       // Lê operação e primeiro operando/destino.
+            if (!p1.empty() && p1.back() == ',')
+                p1.pop_back(); // Remove vírgula.
 
-            istringstream iss(line); // Usa istringstream para parsear a linha
-            string op, op1, op2, op3_or_mem; // op1 é dest para arith/load, src1 para store. op2 é src1 ou offset, etc.
-
-            iss >> op >> op1; // Lê a operação e o primeiro operando/destino
-
-            // Remove vírgula do primeiro operando/destino, se houver
-            if (!op1.empty() && op1[op1.length()-1] == ',')
-            {
-                op1 = op1.substr(0, op1.length()-1);
-            }
-
-            Instruction inst; // Cria uma nova instrução
-
-            // Determina o tipo da instrução e parseia os operandos restantes
+            Instruction inst; // Cria instrução a ser preenchida.
+            // Parseia baseado no tipo de operação.
             if (op == "ADD" || op == "SUB" || op == "MUL" || op == "DIV")
             {
-                if (op == "ADD") inst.type = ADD;
-                else if (op == "SUB") inst.type = SUB;
-                else if (op == "MUL") inst.type = MUL;
-                else if (op == "DIV") inst.type = DIV;
-
-                iss >> op2 >> op3_or_mem; // Lê src1 e src2
-                // Remove vírgula de src1 (op2), se houver
-                if (!op2.empty() && op2[op2.length()-1] == ',')
-                {
-                    op2 = op2.substr(0, op2.length()-1);
-                }
-                inst.dest = op1;    // Registrador destino
-                inst.src1 = op2;    // Primeiro operando fonte
-                inst.src2 = op3_or_mem; // Segundo operando fonte
+                if (op == "ADD")
+                    inst.type = ADD;
+                else if (op == "SUB")
+                    inst.type = SUB;
+                else if (op == "MUL")
+                    inst.type = MUL;
+                else if (op == "DIV")
+                    inst.type = DIV;
+                iss >> p2 >> p3;
+                if (!p2.empty() && p2.back() == ',')
+                    p2.pop_back();
+                inst.dest = p1;
+                inst.src1 = p2;
+                inst.src2 = p3;
             }
             else if (op == "L.D" || op == "LOAD")
             {
                 inst.type = LOAD;
-                inst.dest = op1; // Registrador destino (ex: F2 de "L.D F2, 100(F0)")
-                iss >> op2;      // Lê a referência de memória (ex: "100(F0)")
-                
-                // Parseia "offset(registrador_base)"
-                size_t openParen = op2.find('(');
-                size_t closeParen = op2.find(')');
-                if (openParen != string::npos && closeParen != string::npos)
+                inst.dest = p1; // p1 é registrador destino.
+                iss >> p2;      // p2 é a string "offset(base)".
+                size_t openParen = p2.find('('), closeParen = p2.find(')');
+                if (openParen != string::npos && closeParen != string::npos && closeParen > openParen + 1)
                 {
-                    inst.src1 = op2.substr(0, openParen); // Offset (ex: "100")
-                    inst.src2 = op2.substr(openParen + 1, closeParen - openParen - 1); // Registrador base (ex: "F0")
-                } else {
-                     cerr << "Formato de memoria invalido para LOAD: " << op2 << endl; continue;
+                    inst.src1 = p2.substr(0, openParen);                              // offset.
+                    inst.src2 = p2.substr(openParen + 1, closeParen - openParen - 1); // registrador base.
+                }
+                else
+                {
+                    cerr << "Formato L.D invalido: " << p2 << " na linha: " << line << endl;
+                    continue;
                 }
             }
             else if (op == "S.D" || op == "STORE")
             {
                 inst.type = STORE;
-                // Em "S.D F2, 100(F0)":
-                // op1 é F2 (registrador fonte do dado)
-                // op2 será "100(F0)" (referência de memória)
-                inst.src1 = op1; // Registrador fonte do dado a ser armazenado
-                iss >> op2;      // Lê a referência de memória
-                
-                size_t openParen = op2.find('(');
-                size_t closeParen = op2.find(')');
-                if (openParen != string::npos && closeParen != string::npos)
+                inst.src1 = p1; // p1 é registrador do dado.
+                iss >> p2;      // p2 é "offset(base)".
+                size_t openParen = p2.find('('), closeParen = p2.find(')');
+                if (openParen != string::npos && closeParen != string::npos && closeParen > openParen + 1)
                 {
-                    inst.dest = op2.substr(0, openParen); // Offset (ex: "100") - inst.dest é usado para offset no STORE
-                    inst.src2 = op2.substr(openParen + 1, closeParen - openParen - 1); // Registrador base (ex: "F0")
-                } else {
-                     cerr << "Formato de memoria invalido para STORE: " << op2 << endl; continue;
+                    inst.dest = p2.substr(0, openParen);                              // inst.dest no STORE é usado para o offset.
+                    inst.src2 = p2.substr(openParen + 1, closeParen - openParen - 1); // registrador base.
+                }
+                else
+                {
+                    cerr << "Formato S.D invalido: " << p2 << " na linha: " << line << endl;
+                    continue;
                 }
             }
             else
             {
-                cerr << "Instrucao nao reconhecida: " << op << endl;
-                inst.type = INVALID;
-                continue; // Pula para a próxima linha do arquivo
+                cerr << "Instrucao nao reconhecida: " << op << " na linha: " << line << endl;
+                continue;
             }
-            instructions.push_back(inst); // Adiciona a instrução parseada ao vetor de instruções
+            instructions.push_back(inst);
         }
-        file.close(); // Fecha o arquivo
+        file.close();
         return true;
     }
 
-    // Verifica se a simulação foi concluída (todas as instruções escreveram seus resultados)
+    // Verifica se a simulação terminou.
     bool isSimulationComplete() const
     {
-        // Se todas as instruções tiveram seu 'writeResult' definido para um ciclo válido,
-        // a simulação está completa.
-        for (size_t i = 0; i < instructions.size(); i++)
-        {
-            if (instructions[i].writeResult == -1) // Se alguma instrução ainda não escreveu o resultado
+        // Se ainda há instruções do programa para serem emitidas.
+        if (nextInstructionIndex < static_cast<int>(instructions.size()))
+            return false;
+        // Se o ROB não está completamente vazio (todas as entradas disponíveis).
+        if (robEntriesAvailable != ROB_SIZE)
+            return false;
+        // Se ainda há instruções em unidades funcionais ou aguardando o CDB.
+        if (!executingInstructions.empty() || !completedForCDB.empty())
+            return false;
+
+        // Opcional: uma verificação mais rigorosa seria que todas as instruções no vetor 'instructions'
+        // tenham um 'commitCycle' válido, mas as condições acima geralmente são suficientes
+        // se não houver instruções no início.
+        if (!instructions.empty())
+        { // Só verifica commitCycle se há instruções.
+            for (const auto &inst : instructions)
             {
-                return false; // Simulação não completa
+                if (inst.commitCycle == -1)
+                    return false; // Se alguma não foi cometida.
             }
         }
-        return true; // Todas as instruções completaram
+        return true; // Se todas as condições acima indicam conclusão.
     }
 
-    // Avança um ciclo da simulação, executando as fases do Tomasulo.
+    // Avança um ciclo da simulação, executando as fases do pipeline.
     void stepSimulation()
     {
-        // A ordem das fases é importante para simular corretamente o fluxo de dados e controle.
-        // Em um hardware real, essas fases podem ocorrer em paralelo para diferentes instruções.
-        // A simulação ciclo a ciclo as executa sequencialmente para determinar o estado em cada ciclo.
-
-        // 1. Escrita de Resultados (Write Back):
-        //    Processa instruções que completaram a execução no ciclo anterior e liberam o CDB.
-        //    Deve vir antes do Issue para que os recursos (RS, status de reg) sejam liberados
-        //    e possam ser usados por novas instruções emitidas neste mesmo ciclo.
-        //    Também atualiza RSs esperando por resultados, que podem então começar a executar.
+        // A ordem das fases é importante para o fluxo correto de dados e controle.
+        // 1. Commit: Libera o ROB, atualiza o estado arquitetural. Permite que o issue avance.
+        commitInstruction();
+        // 2. WriteResult (CDB->ROB): Resultados das UFs vão para o ROB e são transmitidos via CDB.
+        //    Isso libera RSs e disponibiliza operandos para outras instruções.
         processWriteBack();
-
-        // 2. Emissão (Issue):
-        //    Tenta emitir uma nova instrução para uma RS, se houver RS disponível.
-        //    Realiza renomeação de registradores e captura de operandos.
-        issueInstruction(); // Tenta emitir a próxima instrução da fila
-
-        // 3. Início da Execução (Execute Start):
-        //    Verifica RSs com operandos prontos e as envia para as unidades funcionais.
-        //    Pode acontecer após o Issue, pois uma instrução emitida pode já ter operandos
-        //    e começar a executar no mesmo ciclo (dependendo da latência da UF e da disponibilidade).
-        //    Também considera resultados do WriteBack deste ciclo que podem ter liberado operandos.
+        // 3. Issue: Novas instruções são alocadas no ROB e nas RSs.
+        //    Pode usar recursos/tags do ROB liberados/atualizados pelo Commit e WriteResult.
+        issueInstruction();
+        // 4. Execute (Start & Advance): Instruções com operandos prontos (potencialmente do WriteResult deste ciclo)
+        //    iniciam ou continuam a execução. O estado no ROB é atualizado.
         startExecution();
-
-        // 4. Avanço da Execução (Execute Advance):
-        //    Decrementa os ciclos restantes para instruções que já estão em execução.
         advanceExecution();
 
-        cycle++; // Avança para o próximo ciclo da simulação
+        cycle++; // Avança o contador de ciclo.
     }
 
-    // Getter para o ciclo atual da simulação
-    int getCurrentCycle() const
-    {
-        return cycle;
-    }
+    int getCurrentCycle() const { return cycle; }
 
-    // Imprime os valores finais dos registradores ao término da simulação.
+    // Imprime os valores finais dos registradores.
     void printRegisters() const
     {
-        cout << "\nValores Finais dos Registradores:\n";
-        cout << "---------------------------------\n";
-        // Itera pelo mapa de registradores e imprime nome e valor
-        for (map<string, int>::const_iterator it = registers.begin(); it != registers.end(); ++it)
-        {
-            cout << it->first << " = " << it->second << endl;
+        cout << "\nValores Finais dos Registradores:\n---------------------------------\n";
+        for (const auto &pairReg : registers)
+        { // Usando range-based for para clareza.
+            cout << pairReg.first << " = " << pairReg.second << endl;
         }
         cout << "---------------------------------\n";
     }
 
-    // Imprime o estado atual da simulação (status das instruções e das Estações de Reserva).
-    // Esta função é crucial para depurar e entender o comportamento do algoritmo ciclo a ciclo.
+    // Imprime o estado detalhado da simulação ciclo a ciclo.
     void printStatus()
     {
-        cout << "\n";
-        cout << "==== Ciclo " << cycle << " ====" << endl;
+        cout << "\n==== Ciclo " << cycle << " ====" << endl;
 
-        // Imprime o status de cada instrução
+        // Tabela de Status das Instruções
         cout << "\nInstrucoes:" << endl;
-        cout << "---------------------------------------------------------------" << endl;
-        cout << "| # | Instrucao          | Emissao | Exec Comp | Write Result |" << endl;
-        cout << "---------------------------------------------------------------" << endl;
-        for (size_t i = 0; i < instructions.size(); i++)
+        printf("---------------------------------------------------------------------------------\n");
+        printf("| %-1s | %-18s | %-7s | %-9s | %-11s | %-11s |\n", "#", "Instrucao", "Emissao", "Exec Comp", "WriteResult", "Commit");
+        printf("---------------------------------------------------------------------------------\n");
+        for (size_t i = 0; i < instructions.size(); ++i)
         {
             const Instruction &inst = instructions[i];
-            string instStr; // String formatada da instrução
-            // Monta a string da instrução baseada no seu tipo e operandos
+            string instStr;
             switch (inst.type)
             {
-            case ADD: instStr = "ADD " + inst.dest + "," + inst.src1 + "," + inst.src2; break;
-            case SUB: instStr = "SUB " + inst.dest + "," + inst.src1 + "," + inst.src2; break;
-            case MUL: instStr = "MUL " + inst.dest + "," + inst.src1 + "," + inst.src2; break;
-            case DIV: instStr = "DIV " + inst.dest + "," + inst.src1 + "," + inst.src2; break;
-            case LOAD: instStr = "LOAD " + inst.dest + "," + inst.src1 + "(" + inst.src2 + ")"; break;
-            case STORE: instStr = "STORE " + inst.src1 + "," + inst.dest + "(" + inst.src2 + ")"; break; // inst.dest é offset aqui
-            default: instStr = "INVALID"; break;
+            case ADD:
+                instStr = "ADD " + inst.dest + "," + inst.src1 + "," + inst.src2;
+                break;
+            case SUB:
+                instStr = "SUB " + inst.dest + "," + inst.src1 + "," + inst.src2;
+                break;
+            case MUL:
+                instStr = "MUL " + inst.dest + "," + inst.src1 + "," + inst.src2;
+                break;
+            case DIV:
+                instStr = "DIV " + inst.dest + "," + inst.src1 + "," + inst.src2;
+                break;
+            case LOAD:
+                instStr = "LOAD " + inst.dest + "," + inst.src1 + "(" + inst.src2 + ")";
+                break;
+            case STORE:
+                instStr = "STORE " + inst.src1 + "," + inst.dest + "(" + inst.src2 + ")";
+                break;
+            default:
+                instStr = "INVALID";
+                break;
             }
+            printf("| %-1zu | %-18s | %-7s | %-9s | %-11s | %-11s |\n", i, instStr.c_str(),
+                   (inst.issue != -1 ? to_string(inst.issue).c_str() : "-"),
+                   (inst.execComp != -1 ? to_string(inst.execComp).c_str() : "-"),
+                   (inst.writeResult != -1 ? to_string(inst.writeResult).c_str() : "-"),
+                   (inst.commitCycle != -1 ? to_string(inst.commitCycle).c_str() : "-"));
+        }
+        printf("---------------------------------------------------------------------------------\n");
 
-            cout << "| " << std::right << std::setw(1) << i << " | " << std::left << setw(18) << instStr << " | ";
-            
-            // Converte ciclos (int) para string para impressão, mostrando "-" se não ocorreu
-            stringstream ssIssue, ssExec, ssWrite;
-            if (inst.issue != -1) ssIssue << inst.issue;
-            if (inst.execComp != -1) ssExec << inst.execComp;
-            if (inst.writeResult != -1) ssWrite << inst.writeResult;
-            
-            cout << setw(7) << (inst.issue != -1 ? ssIssue.str() : "-") << " | ";
-            cout << setw(9) << (inst.execComp != -1 ? ssExec.str() : "-") << " | ";
-            cout << setw(12) << (inst.writeResult != -1 ? ssWrite.str() : "-") << " |" << endl;
-        }
-        cout << "---------------------------------------------------------------" << endl;
+        // Tabela de Estações de Reserva (formato unificado)
+        const char *rsTableFormat = "| %-1zu | %-4s | %-5s | %-5s | %-5s | %-7s | %-7s | %-10s | %-3s | %-7s |\n";
+        const char *rsTableHeader = "| # | Busy | Op    | Vj    | Vk    | Qj(ROB#)| Qk(ROB#)| Dest(ROB#) | A   | InstIdx |\n";
+        string rsLineSeparator = "-------------------------------------------------------------------------------------";
 
-        // Imprime o estado das Estações de Reserva ADD/SUB
-        cout << "\nEstacoes de Reserva ADD/SUB:" << endl;
-        // Cabeçalho da tabela de RS:
-        // #: Índice da RS
-        // Busy: Se está ocupada (Sim/Nao)
-        // Op: Operação (ADD, SUB)
-        // Vj, Vk: Valores dos operandos (se disponíveis)
-        // Qj, Qk: Tags das RSs que produzirão os operandos (se esperando)
-        // Dest: Tag da RS de destino ou nome do registrador destino
-        // A: Campo de endereço (não usado por ADD/SUB RSs, mas impresso para consistência da tabela)
-        // InstIdx: Índice da instrução original ocupando esta RS
-        cout << "-----------------------------------------------------------------" << endl;
-        cout << "| # | Busy | Op  | Vj  | Vk  | Qj  | Qk  | Dest | A   | InstIdx |" << endl;
-        cout << "-----------------------------------------------------------------" << endl;
-        for (size_t i = 0; i < addRS.size(); i++)
+        auto printRSGroup = [&](const string &name, const vector<ReservationStation> &rsGroup)
         {
-            const ReservationStation &rs = addRS[i];
-            string opStr = rs.busy ? (rs.op == ADD ? "ADD" : (rs.op == SUB ? "SUB" : "???")) : "";
-            cout << "| " << setw(1) << i << " | " << setw(4) << (rs.busy ? "Sim" : "Nao") << " | " << setw(3) << opStr << " | ";
-            stringstream ssVj, ssVk, ssA, ssInstIdx;
-            if (rs.busy && rs.Qj.empty()) ssVj << rs.Vj;
-            if (rs.busy && rs.Qk.empty()) ssVk << rs.Vk;
-            if (rs.busy) ssA << rs.A; // A não é usado por ADD/SUB, será 0
-            if (rs.busy && rs.instructionIndex != -1) ssInstIdx << rs.instructionIndex;
-            cout << setw(3) << (rs.busy && rs.Qj.empty() ? ssVj.str() : "-") << " | ";
-            cout << setw(3) << (rs.busy && rs.Qk.empty() ? ssVk.str() : "-") << " | ";
-            cout << setw(3) << (rs.busy && !rs.Qj.empty() ? rs.Qj : "-") << " | ";
-            cout << setw(3) << (rs.busy && !rs.Qk.empty() ? rs.Qk : "-") << " | ";
-            cout << setw(4) << (rs.busy ? rs.dest : "-") << " | ";
-            cout << setw(3) << (rs.busy ? ssA.str() : "-") << " | ";
-            cout << setw(7) << (rs.busy && rs.instructionIndex !=-1 ? ssInstIdx.str() : "-") << " |" << endl;
-        }
-        cout << "-----------------------------------------------------------------" << endl;
+            cout << "\nEstacoes de Reserva " << name << ":" << endl
+                 << rsLineSeparator << endl
+                 << rsTableHeader << rsLineSeparator << endl;
+            for (size_t i = 0; i < rsGroup.size(); ++i)
+            {
+                const auto &rs = rsGroup[i];
+                string opStr;
+                if (rs.busy)
+                    switch (rs.op)
+                    {
+                    case ADD:
+                        opStr = "ADD";
+                        break;
+                    case SUB:
+                        opStr = "SUB";
+                        break;
+                    case MUL:
+                        opStr = "MUL";
+                        break;
+                    case DIV:
+                        opStr = "DIV";
+                        break;
+                    case LOAD:
+                        opStr = "LOAD";
+                        break;
+                    case STORE:
+                        opStr = "STORE";
+                        break;
+                    default:
+                        opStr = "???";
+                    }
+                printf(rsTableFormat, i, (rs.busy ? "Sim" : "Nao"), opStr.c_str(),
+                       (rs.busy && rs.Qj.empty() ? to_string(rs.Vj).c_str() : "-"),
+                       (rs.busy && rs.Qk.empty() ? to_string(rs.Vk).c_str() : "-"),
+                       (rs.busy && !rs.Qj.empty() ? rs.Qj.c_str() : "-"),
+                       (rs.busy && !rs.Qk.empty() ? rs.Qk.c_str() : "-"),
+                       (rs.busy ? rs.destRobIndex.c_str() : "-"),
+                       (rs.busy && (rs.op == LOAD || rs.op == STORE) ? to_string(rs.A).c_str() : "-"), // Mostrar A apenas para L/S
+                       (rs.busy && rs.instructionIndex != -1 ? to_string(rs.instructionIndex).c_str() : "-"));
+            }
+            cout << rsLineSeparator << endl;
+        };
+        printRSGroup("ADD/SUB", addRS);
+        printRSGroup("MUL/DIV", mulRS);
+        printRSGroup("LOAD", loadRS);
+        printRSGroup("STORE", storeRS);
 
-        // Imprime o estado das Estações de Reserva MUL/DIV (lógica similar à ADD/SUB)
-        cout << "\nEstacoes de Reserva MUL/DIV:" << endl;
-        cout << "-----------------------------------------------------------------" << endl;
-        cout << "| # | Busy | Op  | Vj  | Vk  | Qj  | Qk  | Dest | A   | InstIdx |" << endl;
-        cout << "-----------------------------------------------------------------" << endl;
-        for (size_t i = 0; i < mulRS.size(); i++)
+        // Tabela do Reorder Buffer (ROB)
+        cout << "\nReorder Buffer (ROB): Head=" << robHead << ", Tail=" << robTail << ", Available=" << robEntriesAvailable << endl;
+        const char *robTableFormat = "| %-4d | %-4s | %-7s | %-5s | %-11s | %-7s | %-6s | %-5s | %-7s |\n";
+        cout << "------------------------------------------------------------------------------------------" << endl;
+        cout << "| ROB# | Busy | InstIdx | Type  | State       | DestReg | ValRdy | Value | Address |" << endl;
+        cout << "------------------------------------------------------------------------------------------" << endl;
+        for (int i = 0; i < ROB_SIZE; ++i)
         {
-            const ReservationStation &rs = mulRS[i];
-            string opStr = rs.busy ? (rs.op == MUL ? "MUL" : (rs.op == DIV ? "DIV" : "???")) : "";
-            cout << "| " << setw(1) << i << " | " << setw(4) << (rs.busy ? "Sim" : "Nao") << " | " << setw(3) << opStr << " | ";
-            stringstream ssVj, ssVk, ssA, ssInstIdx;
-            if (rs.busy && rs.Qj.empty()) ssVj << rs.Vj;
-            if (rs.busy && rs.Qk.empty()) ssVk << rs.Vk;
-            if (rs.busy) ssA << rs.A; // A não é usado por MUL/DIV, será 0
-            if (rs.busy && rs.instructionIndex != -1) ssInstIdx << rs.instructionIndex;
-            cout << setw(3) << (rs.busy && rs.Qj.empty() ? ssVj.str() : "-") << " | ";
-            cout << setw(3) << (rs.busy && rs.Qk.empty() ? ssVk.str() : "-") << " | ";
-            cout << setw(3) << (rs.busy && !rs.Qj.empty() ? rs.Qj : "-") << " | ";
-            cout << setw(3) << (rs.busy && !rs.Qk.empty() ? rs.Qk : "-") << " | ";
-            cout << setw(4) << (rs.busy ? rs.dest : "-") << " | ";
-            cout << setw(3) << (rs.busy ? ssA.str() : "-") << " | ";
-            cout << setw(7) << (rs.busy && rs.instructionIndex != -1 ? ssInstIdx.str() : "-") << " |" << endl;
-        }
-        cout << "-----------------------------------------------------------------" << endl;
-        
-        // Imprime o estado das Estações de Reserva LOAD
-        // Qj não é usado para LOAD (não tem operando fonte de dados). Vk/Qk é para o registrador base.
-        // Dest é o registrador destino. A é o offset.
-        cout << "\nEstacoes de Reserva LOAD:" << endl;
-        cout << "-----------------------------------------------------------------" << endl;
-        cout << "| # | Busy | Op  | Vj  | Vk  | Qj  | Qk  | Dest | A   | InstIdx |" << endl;
-        cout << "-----------------------------------------------------------------" << endl;
-        for (size_t i = 0; i < loadRS.size(); i++)
-        {
-            const ReservationStation &rs = loadRS[i];
-            string opStr = rs.busy ? (rs.op == LOAD ? "LOAD" : "???") : "";
-            cout << "| " << setw(1) << i << " | " << setw(4) << (rs.busy ? "Sim" : "Nao") << " | " << setw(3) << opStr << " | ";
-            stringstream ssVj, ssVk, ssA, ssInstIdx;
-            if (rs.busy && rs.Qj.empty()) ssVj << rs.Vj; // Vj não é usado por LOAD, será 0
-            if (rs.busy && rs.Qk.empty()) ssVk << rs.Vk; // Vk é valor do reg. base
-            if (rs.busy) ssA << rs.A;                   // A é o offset
-            if (rs.busy && rs.instructionIndex != -1) ssInstIdx << rs.instructionIndex;
-            cout << setw(3) << (rs.busy && rs.Qj.empty() ? ssVj.str() : "-") << " | "; // Vj (sempre - ou 0)
-            cout << setw(3) << (rs.busy && rs.Qk.empty() ? ssVk.str() : "-") << " | "; // Vk (valor do reg. base)
-            cout << setw(3) << (rs.busy && !rs.Qj.empty() ? rs.Qj : "-") << " | "; // Qj (sempre -)
-            cout << setw(3) << (rs.busy && !rs.Qk.empty() ? rs.Qk : "-") << " | "; // Qk (tag do reg. base)
-            cout << setw(4) << (rs.busy ? rs.dest : "-") << " | "; // Registrador Destino
-            cout << setw(3) << (rs.busy ? ssA.str() : "-") << " | "; // Offset
-            cout << setw(7) << (rs.busy && rs.instructionIndex != -1 ? ssInstIdx.str() : "-") << " |" << endl;
-        }
-        cout << "-----------------------------------------------------------------" << endl;
+            const auto &entry = rob[i];
+            string typeStr = entry.busy ? (entry.type == ADD ? "ADD" : entry.type == SUB ? "SUB"
+                                                                   : entry.type == MUL   ? "MUL"
+                                                                   : entry.type == DIV   ? "DIV"
+                                                                   : entry.type == LOAD  ? "LOAD"
+                                                                   : entry.type == STORE ? "STORE"
+                                                                                         : "INV")
+                                        : "---";
+            string stateStr = entry.busy ? (entry.state == ROB_ISSUE ? "Issue" : entry.state == ROB_EXECUTE   ? "Execute"
+                                                                             : entry.state == ROB_WRITERESULT ? "WriteRes"
+                                                                                                              : "Empty")
+                                         : "---";
+            string value_s = (entry.busy && entry.valueReady) ? to_string(entry.value) : "-";
+            string address_s = (entry.busy && (entry.type == LOAD || entry.type == STORE) && entry.address != 0) ? to_string(entry.address) : "-"; // Mostrar endereço se for L/S e calculado.
+            if (entry.busy && entry.type == STORE && !entry.valueReady && entry.state == ROB_WRITERESULT)
+                value_s = "(pend)"; // Dado do store pendente mas endereço pronto
 
-        // Imprime o estado das Estações de Reserva STORE
-        // Vj/Qj é para o dado a ser armazenado. Vk/Qk é para o registrador base.
-        // Dest não é usado (STORE não escreve em registrador). A é o offset.
-        cout << "\nEstacoes de Reserva STORE:" << endl;
-        cout << "-----------------------------------------------------------------" << endl;
-        cout << "| # | Busy | Op  | Vj  | Vk  | Qj  | Qk  | Dest | A   | InstIdx |" << endl;
-        cout << "-----------------------------------------------------------------" << endl;
-        for (size_t i = 0; i < storeRS.size(); i++)
-        {
-            const ReservationStation &rs = storeRS[i];
-            string opStr = rs.busy ? (rs.op == STORE ? "STORE" : "???") : "";
-            cout << "| " << setw(1) << i << " | " << setw(4) << (rs.busy ? "Sim" : "Nao") << " | " << setw(3) << opStr << " | ";
-            stringstream ssVj, ssVk, ssA, ssInstIdx;
-            if (rs.busy && rs.Qj.empty()) ssVj << rs.Vj; // Vj é o valor do dado a ser armazenado
-            if (rs.busy && rs.Qk.empty()) ssVk << rs.Vk; // Vk é valor do reg. base
-            if (rs.busy) ssA << rs.A;                   // A é o offset
-            if (rs.busy && rs.instructionIndex != -1) ssInstIdx << rs.instructionIndex;
-            cout << setw(3) << (rs.busy && rs.Qj.empty() ? ssVj.str() : "-") << " | "; // Vj (dado)
-            cout << setw(3) << (rs.busy && rs.Qk.empty() ? ssVk.str() : "-") << " | "; // Vk (valor do reg. base)
-            cout << setw(3) << (rs.busy && !rs.Qj.empty() ? rs.Qj : "-") << " | "; // Qj (tag do dado)
-            cout << setw(3) << (rs.busy && !rs.Qk.empty() ? rs.Qk : "-") << " | "; // Qk (tag do reg. base)
-            cout << setw(4) << (rs.busy ? rs.dest : "-") << " | "; // Dest (não usado, será - ou vazio)
-            cout << setw(3) << (rs.busy ? ssA.str() : "-") << " | "; // Offset
-            cout << setw(7) << (rs.busy && rs.instructionIndex != -1 ? ssInstIdx.str() : "-") << " |" << endl;
+            printf(robTableFormat, i, (entry.busy ? "Sim" : "Nao"),
+                   (entry.busy && entry.instructionIndex != -1 ? to_string(entry.instructionIndex).c_str() : "-"),
+                   typeStr.c_str(), stateStr.c_str(),
+                   (entry.busy ? entry.destinationRegister.c_str() : "-"),
+                   (entry.busy ? (entry.valueReady ? "Sim" : "Nao") : "-"),
+                   value_s.c_str(), address_s.c_str());
         }
-        cout << "-----------------------------------------------------------------" << endl;
+        cout << "------------------------------------------------------------------------------------------" << endl;
+
+        // Tabela de Status dos Registradores
+        cout << "\nRegister Status:" << endl;
+        printf("---------------------\n");
+        printf("| Reg | Busy | ROB# |\n");
+        printf("---------------------\n");
+        bool anyRegBusy = false;
+        for (const auto &pair : regStatus)
+        {
+            if (pair.second.busy)
+            {
+                anyRegBusy = true;
+                printf("| %-3s | %-4s | %-4s |\n",
+                       pair.first.c_str(), "Sim", to_string(pair.second.robIndex).c_str());
+            }
+        }
+        if (!anyRegBusy)
+        {
+            printf("| --- | Nao  | -    |\n"); // Linha para indicar que todos estão livres
+        }
+        printf("---------------------\n");
     }
 }; // Fim da classe TomasuloSimulator
 
-// Função principal do programa
+// Função principal - Ponto de entrada do programa
 int main()
 {
-    TomasuloSimulator simulator; // Cria uma instância do simulador
+    // Cria o simulador com contagens específicas de RS e tamanho do ROB.
+    // Ex: TomasuloSimulator simulator(3, 2, 3, 3, 8); // 3 AddRS, 2 MulRS, 3 LoadRS, 3 StoreRS, ROB com 8 entradas.
+    TomasuloSimulator simulator; // Usa tamanhos padrão (3,2,3,3 para RSs, 16 para ROB).
 
     string filename;
     cout << "Digite o nome do arquivo de instrucoes: ";
-    cin >> filename; // Pede ao usuário o nome do arquivo de instruções
+    cin >> filename; // Solicita o nome do arquivo de entrada.
 
-    // Carrega as instruções do arquivo
     if (!simulator.loadInstructions(filename))
-    {
+    { // Carrega as instruções.
         cerr << "Falha ao carregar instrucoes. Finalizando." << endl;
-        return 1; // Encerra se houver erro ao carregar
+        return 1;
     }
 
-    // Loop principal da simulação: continua enquanto houver instruções não concluídas
+    // Loop principal da simulação: continua até todas as instruções serem cometidas.
     while (!simulator.isSimulationComplete())
     {
-        simulator.printStatus(); // Imprime o estado atual da simulação
-        simulator.stepSimulation(); // Avança um ciclo na simulação
+        simulator.printStatus();    // Imprime o estado atual.
+        simulator.stepSimulation(); // Avança um ciclo.
 
         cout << "\nAvancar para o proximo ciclo? [Pressione ENTER]";
-        // Limpa o buffer de entrada antes de esperar pelo Enter,
-        // especialmente após um 'cin >> filename' que pode deixar um '\n'.
-        cin.ignore(numeric_limits<streamsize>::max(), '\n'); 
-        cin.get(); // Espera o usuário pressionar Enter
+        // Limpa o buffer de entrada para garantir que o cin.get() funcione corretamente após um cin >> string.
+        if (cin.peek() == '\n')
+            cin.ignore();
+        else
+            cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        cin.get(); // Aguarda o usuário.
     }
 
-    // Simulação concluída
-    cout << "\n=== Simulacao concluida no ciclo " << simulator.getCurrentCycle() -1 << " ===" << endl; // -1 porque o ciclo avança antes da verificação final
-    simulator.printStatus();      // Imprime o estado final
-    simulator.printRegisters();   // Imprime os valores finais dos registradores
-
-    return 0; // Fim do programa
+    // Simulação concluída.
+    cout << "\n=== Simulacao concluida no ciclo " << simulator.getCurrentCycle() - 1 << " ===" << endl;
+    simulator.printStatus();    // Imprime o estado final.
+    simulator.printRegisters(); // Imprime os valores finais dos registradores.
+    return 0;
 }
