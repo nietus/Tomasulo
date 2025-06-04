@@ -6,7 +6,7 @@ Este projeto é um simulador em C++ do algoritmo de Tomasulo, uma técnica de ha
   <img src='tomasulo_diagram.png' alt="Diagrama do Algoritmo de Tomasulo" width="500">
 </p>
 <p align="center">
-  <em>Diagrama conceitual da arquitetura de Tomasulo (Fonte da imagem: Trabalho do usuário).</em>
+  <em>Diagrama conceitual da arquitetura de Tomasulo.</em>
 </p>
 
 ## Funcionalidades Implementadas
